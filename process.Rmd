@@ -1,0 +1,294 @@
+---
+title: "Untitled"
+author: "avanvalken"
+date: "2025-02-27"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    theme: "flatly"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library("readxl")
+library(SummarizedExperiment)
+library(SingleCellExperiment)
+library(singleCellTK)
+library(cowplot)
+library(patchwork)
+library(TBSignatureProfiler)
+library(umap)
+library(limma)
+library(ComplexHeatmap)
+library(DT)
+
+
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load data {.tabset}
+```{r}
+# raw unnormalized counts
+counts <- read_tsv("data/raw_gene_counts.txt")
+metadata <- read.csv("data/metadata.csv")
+genekey <- read.csv("data/mouse_gene_id_type_name.csv")
+
+# subject data
+# group a and group b
+n <- colnames(counts)
+n <- n[3:30]
+counts$Geneid <- NULL
+
+# get only protein-coding genes from key
+protein_coding <- dplyr::filter(genekey, gene_type=="protein_coding")$gene_name
+
+# select only columns with metadata
+counts.1 <- counts[, c("gene_name", metadata$SampleName)] %>% 
+               group_by(gene_name) %>% 
+               summarise_all(funs(sum)) %>% 
+               dplyr::filter(gene_name %in% protein_coding) %>% 
+               column_to_rownames(var="gene_name")
+
+# add columns to metadata
+metadata <- metadata %>% 
+               mutate(primed=ifelse(grepl("nonprimed", Group, ignore.case = T), "No", "Yes"),
+                      infection=ifelse(grepl("Infected", Group, ignore.case = F), "Infected", "Uninfected"))
+
+# make summarized experiment objec
+se <- SummarizedExperiment(assays=list("counts"=as.matrix(counts.1)),
+                           colData = metadata)
+# Want to have 5% present rate
+se <- se[apply(assay(se,"counts") != 0, 1, mean)>.2,] 
+
+# get log-counts-cpm
+se <- mkAssay(se,  log = TRUE)
+
+#saveRDS(se, "data/processed_se.RDS")
+```
+
+# Dimension Reduction  {.tabset}
+```{r}
+# path to save
+path <- file.path("outs/dimension_reduction")
+
+```
+
+## PCA
+```{r}
+
+
+se_tmp <- SummarizedExperiment(assays=list(counts=assays(se)$log_counts_cpm), colData = colData(se))
+
+#se_tmp <- se_tmp[,-which(colnames(se_tmp) %in% c("10200107A0"))]
+
+names(se_tmp) <- "counts"
+
+se_tmp2 <- as(se_tmp, "SingleCellExperiment")
+#plotPCA(DESeqTransform(se_tmp)) ## only uses counts assay
+
+
+# need to install "scater" package
+g <- singleCellTK::plotPCA(se_tmp2, colorBy = "Group", useAssay = "counts", runPCA = TRUE)
+
+
+g <- g + geom_point(size = 1.5) + ggtitle("PCA")
+g
+
+```
+
+## UMAP
+```{r umap-all}
+assay_type = "log_counts_cpm"
+
+set.seed(1)
+umap_out <- umap(t(assay(se, assay_type)), n_neighbors=4)
+
+embedding <- as.data.frame(umap_out$layout)
+embedding$Class <- as.factor(se$Group)
+
+g <- ggplot(embedding, aes(x=V1, y=V2, color=Class,  label = colnames(assay(se, assay_type)))) + 
+  geom_point(size=3) + 
+  xlab("UMAP 1") + 
+  ylab("UMAP 2") + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  ggtitle("UMAP Plot") #+ 
+ #geom_text(aes(label=rownames(embedding), label.size = 0.10),hjust=0, vjust=0)
+
+plot(g)
+
+```
+
+
+# Differential Expression {.tabset}
+```{r, include=FALSE}
+# path to save
+path <- file.path("outs/differential_expression")
+
+```
+
+## "PrimedInfected" vs "NonPrimedInfected" {.tabset}
+```{r}
+sub <- se[,colData(se)$infection=="Infected"]
+designMat <- model.matrix(~factor(Group) , data=colData(sub))
+
+colnames(designMat)
+colnames(designMat) <- c("Intercept", "Primed")
+
+head(designMat)
+
+fit <- lmFit(assay(sub, "log_counts_cpm"), designMat)
+
+# Difference in expression between Failures and controls 
+
+contrast.matrixNut<- makeContrasts(Primed, levels = designMat)
+fitNut <- contrasts.fit(fit,contrast.matrixNut)
+fitNut <- eBayes(fitNut)
+limmaResNut <- topTable(fitNut, adjust.method = "BH", n = Inf, sort.by = "P")
+
+
+dim(limmaResNut[limmaResNut$adj.P.Val <0.05,])  # 6 genes
+# IL21
+
+new_hist_padjval_100breaks <- hist(limmaResNut$adj.P.Val, breaks=100)
+new_hist_pval_100breaks <- hist(limmaResNut$P.Value, breaks=100)
+##shows spike near 0
+
+sig_limmaResNut <- limmaResNut[limmaResNut$adj.P.Val <0.05,]
+sig_limmaResNut <- sig_limmaResNut[order(sig_limmaResNut$adj.P.Val),]
+
+#write.csv(sig_limmaResNut, "sig_tbfail_india_baseline.csv")
+
+top_500_genes <- limmaResNut[1:500,]
+top_1k_genes <- limmaResNut[1:1000,]
+## top 50 by logfc
+###top 50 by p.adj value
+top_50 <- sig_limmaResNut[1:50,]
+#write.csv(top_50, "top_50_by_padj.csv")
+
+
+neg_25_log <- (limmaResNut[limmaResNut$logFC < 0,])
+neg_25_log <- neg_25_log[order(neg_25_log$logFC),]
+neg_25_log <- neg_25_log[1:25,]
+
+#write.csv(neg_25_log, "neg_25_logfc.csv")
+
+top25_lot <- limmaResNut[limmaResNut$logFC >= 0,]
+top25_log <- top25_lot[order(-top25_lot$logFC),]
+top25_log <- top25_log[1:25,]
+```
+### 2 All genes datatable and heatmap {.tabset}
+```{r }
+datatable(sig_limmaResNut, 
+          options=list(scrollX=T,pageLength=20),
+          rownames = T)
+
+## Make a Heatmap of all genes
+mat = as.matrix(assay(sub[row.names(sig_limmaResNut),],"log_counts_cpm"))
+mat = t(scale(t(mat)))
+
+df=data.frame(Primed=colData(sub)$"primed",
+              Infection=colData(sub)$"infection") 
+# 
+# df=df[order(df$BMI),]
+
+#o1 = seriate(dist(mat), method = "TSP")
+#o2 = seriate(dist(t(mat)), method = "TSP")
+
+ha = HeatmapAnnotation(df = df)
+
+g <- Heatmap(mat, show_row_names=T,show_column_names = F, top_annotation = ha, cluster_columns = T )
+g
+```
+
+
+## "Primed" vs "Unprimed"  {.tabset}
+```{r}
+designMat <- model.matrix(~factor(primed) + factor(infection) , data=colData(se))
+
+colnames(designMat)
+colnames(designMat) <- c("Intercept", "Primed", "Uninfected")
+
+head(designMat)
+
+fit <- lmFit(assay(se, "log_counts_cpm"), designMat)
+
+# Difference in expression between Failures and controls 
+
+contrast.matrixNut<- makeContrasts(Primed, levels = designMat)
+fitNut <- contrasts.fit(fit,contrast.matrixNut)
+fitNut <- eBayes(fitNut)
+limmaResNut <- topTable(fitNut, adjust.method = "BH", n = Inf, sort.by = "P")
+
+
+dim(limmaResNut[limmaResNut$adj.P.Val <0.05,])  # 6 genes
+# IL21
+
+new_hist_padjval_100breaks <- hist(limmaResNut$adj.P.Val, breaks=100)
+new_hist_pval_100breaks <- hist(limmaResNut$P.Value, breaks=100)
+##shows spike near 0
+
+sig_limmaResNut <- limmaResNut[limmaResNut$adj.P.Val <0.05,]
+sig_limmaResNut <- sig_limmaResNut[order(sig_limmaResNut$adj.P.Val),]
+
+#write.csv(sig_limmaResNut, "sig_tbfail_india_baseline.csv")
+
+top_500_genes <- limmaResNut[1:500,]
+top_1k_genes <- limmaResNut[1:1000,]
+## top 50 by logfc
+###top 50 by p.adj value
+top_50 <- sig_limmaResNut[1:50,]
+#write.csv(top_50, "top_50_by_padj.csv")
+
+
+neg_25_log <- (limmaResNut[limmaResNut$logFC < 0,])
+neg_25_log <- neg_25_log[order(neg_25_log$logFC),]
+neg_25_log <- neg_25_log[1:25,]
+
+#write.csv(neg_25_log, "neg_25_logfc.csv")
+
+top25_lot <- limmaResNut[limmaResNut$logFC >= 0,]
+top25_log <- top25_lot[order(-top25_lot$logFC),]
+top25_log <- top25_log[1:25,]
+```
+### 2 All genes datatable and heatmap {.tabset}
+```{r }
+datatable(sig_limmaResNut, 
+          options=list(scrollX=T,pageLength=20),
+          rownames = T)
+
+## Make a Heatmap of all genes
+mat = as.matrix(assay(se[row.names(sig_limmaResNut),],"log_counts_cpm"))
+mat = t(scale(t(mat)))
+
+df=data.frame(Primed=colData(se)$"primed",
+              Infection=colData(se)$"infection") 
+# 
+# df=df[order(df$BMI),]
+
+#o1 = seriate(dist(mat), method = "TSP")
+#o2 = seriate(dist(t(mat)), method = "TSP")
+
+ha = HeatmapAnnotation(df = df)
+
+g <- Heatmap(mat, show_row_names=T,show_column_names = F, top_annotation = ha, cluster_columns = T )
+g
+```
+
+
+```{r}
+# genes <- rownames(sig_limmaResNut)
+# plotDEGViolin(se_tmp2, groups = Group, features= genes )
+```
+
+
+## "NonPrimedUninfected" vs all
+## "NonPrimedInfected" vs all
+## "PrimedInfected" vs all
+## "PrimedUninfected" vs all
+
+
