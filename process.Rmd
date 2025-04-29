@@ -101,6 +101,14 @@ g
 
 ```
 
+### save
+```{r}
+ggsave(file.path(path, "pca.png"), width=4, height=4)
+ggsave(file.path(path, "pca.svg"), width=4, height=4)
+
+```
+
+
 ## UMAP
 ```{r umap-all}
 assay_type = "log_counts_cpm"
@@ -123,16 +131,24 @@ plot(g)
 
 ```
 
+### save
+```{r}
+ggsave(file.path(path, "umap.png"), width=4, height=4)
+ggsave(file.path(path, "umap.svg"), width=4, height=4)
+
+```
 
 # Differential Expression {.tabset}
 ```{r, include=FALSE}
 # path to save
-path <- file.path("outs/differential_expression")
+path.dir <- file.path("outs/differential_expression")
 
 ```
 
 ## "PrimedInfected" vs "NonPrimedInfected" {.tabset}
 ```{r}
+path <- file.path(path.dir, "limma", "primed_vs_unprimed_infected")
+dir.create(path, recursive = T)
 sub <- se[,colData(se)$infection=="Infected"]
 designMat <- model.matrix(~factor(Group) , data=colData(sub))
 
@@ -160,6 +176,7 @@ new_hist_pval_100breaks <- hist(limmaResNut$P.Value, breaks=100)
 
 sig_limmaResNut <- limmaResNut[limmaResNut$adj.P.Val <0.05,]
 sig_limmaResNut <- sig_limmaResNut[order(sig_limmaResNut$adj.P.Val),]
+
 
 #write.csv(sig_limmaResNut, "sig_tbfail_india_baseline.csv")
 
@@ -203,6 +220,20 @@ ha = HeatmapAnnotation(df = df)
 
 g <- Heatmap(mat, show_row_names=T,show_column_names = F, top_annotation = ha, cluster_columns = T )
 g
+```
+
+### save
+```{r}
+#PrimedInfected" vs "NonPrimedInfected
+png(file.path(path, "primed_vs_nonprimed_infected_siggenes_subset_limma.png"), width = 4, height=4,res=300, units="in")
+g
+dev.off()
+svg(file.path(path, "primed_vs_nonprimed_infected_siggenes_subset_limma.svg"), width = 4, height=4)
+g
+dev.off()
+
+limmaResNut[order(limmaResNut$adj.P.Val),]
+write.csv(limmaResNut[1:1000,], file=file.path(path, "primed_vs_nonprimed_infected_top1k_diffex_genes.csv"))
 ```
 
 
@@ -279,10 +310,218 @@ g <- Heatmap(mat, show_row_names=T,show_column_names = F, top_annotation = ha, c
 g
 ```
 
+### save
+```{r}
+#Primed" vs "NonPrimed" control for infection
+png(file.path(path, "primed_vs_nonprimed_control_for_infection_siggenes_limma.png"), width = 4, height=4,res=300, units="in")
+g
+dev.off()
+svg(file.path(path, "primed_vs_nonprimed_control_for_infection_siggenes_limma.svg"), width = 4, height=4)
+g
+dev.off()
+
+limmaResNut[order(limmaResNut$adj.P.Val),]
+write.csv(limmaResNut[1:1000,], file=file.path(path, "primed_vs_nonprimed_control_for_infection_siggenes_top1k_diffex_genes.csv"))
+```
 
 ```{r}
-# genes <- rownames(sig_limmaResNut)
-# plotDEGViolin(se_tmp2, groups = Group, features= genes )
+
+df=data.frame(Primed=colData(se)$"primed",
+              Infection=colData(se)$"infection",
+              Sample=colData(se)$"SampleName",
+              Group=colData(se)$"Group") 
+rownames(df) <- df$SampleName
+## Make a boxplot of all genes
+mat = as.matrix(assay(se[row.names(sig_limmaResNut),],"log_counts_cpm"))
+mat = (scale(t(mat)))
+mat.1 <- as.data.frame(mat) %>% cbind(df)
+mat.2 <- reshape2::melt(mat.1, id.vars=c(6:9), measure.vars=c(1:5))
+
+ggplot(mat.2, aes(x=variable, y=value, fill=Group)) + geom_boxplot()
+ggsave(file.path(path, "limma_sig_genes_boxplot_primed-vs-unprimed-con-inf.png"), width=4, height=4)
+ggsave(file.path(path, "limma_sig_genes_boxplot_primed-vs-unprimed-con-inf.svg"), width=4, height=4)
+```
+
+
+# DeSEQ2
+## Primed vs Unprimed, Infected
+```{r}
+library(DESeq2)
+path <- file.path("outs/differential_expression/primed_vs_unprimed_infected")
+dir.create(path)
+sub <- se[,colData(se)$infection=="Infected"]
+designMat <- model.matrix(~factor(condition), data=colData(sub))
+
+colnames(designMat)
+colnames(designMat) <- gsub("factor\\(condition\\)", "", colnames(designMat))
+colnames(designMat) <- gsub("\\(Intercept\\)", "Intercept", colnames(designMat))
+
+mat <- assay(sub, "counts")
+coldata <- as.data.frame(colData(sub)) %>% select(c(primed))
+
+mat <- mat[,rownames(coldata)]
+
+dds <- DESeqDataSetFromMatrix(countData = mat,
+                              colData = coldata,
+                              design= ~factor(primed))
+# keep rows with more than 10 total counts
+keep <- rowSums(counts(dds))>=10
+dds <- dds[keep,]
+
+# set the reference
+dds$primed <- relevel(dds$primed, "No")
+
+# run DeSEQ
+dds <- DESeq(dds)
+resultsNames(dds) # lists the coefficients
+res <- results(dds)
+summary(res)
+res05 <- results(dds, alpha=0.05)
+summary(res05)
+# or to shrink log fold changes association with condition:
+res <- lfcShrink(dds, coef="factor.primed.Yes", type="apeglm")
+# Zhu, A., Ibrahim, J.G., Love, M.I. (2018) Heavy-tailed prior distributions for
+#     sequence count data: removing the noise and preserving large differences.
+#     Bioinformatics. https://doi.org/10.1093/bioinformatics/bty895
+par(mar=c(1,1,1,1))
+g.1 <- plotMA(res, ylim=c(-2,2), returnData=T)
+g<- plotMA(res, ylim=c(-2,2))
+png(file.path(path, "mean_normalized_counts_apglm_DeSEQ2.png"), res = 300, width=4, height = 4, units = "in")
+g
+dev.off()
+svg(file.path(path, "mean_normalized_counts_apglm_DeSEQ2.svg"), width=4, height = 4)
+g
+dev.off()
+
+df <- as.data.frame(res05) %>% filter(pvalue < 0.00125)
+write.csv(df, 
+          file=file.path(path,"infected_prime_vs_unprimed_deseq2_results.csv"))
+```
+
+### DeSEQ results heatmap
+```{r}
+library("pheatmap")
+ntd <- normTransform(dds)
+select <- as.data.frame(res05) %>% filter(pvalue < 0.00125) %>% rownames()
+mat <- assay(ntd[select,])
+mat.1 <- t(scale(t(mat)))
+df <- as.data.frame(colData(dds))
+df$sizeFactor <- NULL
+names(df) <- "primed"
+g <- pheatmap(mat.1, cluster_rows=T, show_rownames=F,
+         cluster_cols=T, annotation_col=df)
+g
+```
+
+#### save
+```{r}
+png(file.path(path, "sig_genes_DeSEQ2_heatmap_infected-primed-vs-unprimed.png"), res = 300, width=4, height = 4)
+g
+dev.off()
+svg(file.path(path, "sig_genes_DeSEQ2_heatmap_infected-primed-vs-unprimed.svg"), width=4, height = 4)
+g
+dev.off()
+
+
+
+```
+
+
+## Primed vs Unprimed, Uninfected
+```{r}
+#library(DESeq2)
+path <- file.path("outs/differential_expression/primed_vs_unprimed_uninfected")
+dir.create(path)
+sub <- se[,colData(se)$infection=="Uninfected"]
+designMat <- model.matrix(~factor(condition), data=colData(sub))
+
+colnames(designMat)
+colnames(designMat) <- gsub("factor\\(condition\\)", "", colnames(designMat))
+colnames(designMat) <- gsub("\\(Intercept\\)", "Intercept", colnames(designMat))
+
+mat <- assay(sub, "counts")
+coldata <- as.data.frame(colData(sub)) %>% select(c(primed))
+
+mat <- mat[,rownames(coldata)]
+
+dds <- DESeqDataSetFromMatrix(countData = mat,
+                              colData = coldata,
+                              design= ~factor(primed))
+# keep rows with more than 10 total counts
+keep <- rowSums(counts(dds))>=10
+dds <- dds[keep,]
+
+# set the reference
+dds$primed <- relevel(dds$primed, "No")
+
+# run DeSEQ
+dds <- DESeq(dds)
+resultsNames(dds) # lists the coefficients
+res <- results(dds)
+summary(res)
+res05 <- results(dds, alpha=0.05)
+summary(res05)
+# or to shrink log fold changes association with condition:
+res <- lfcShrink(dds, coef="factor.primed.Yes", type="apeglm")
+# Zhu, A., Ibrahim, J.G., Love, M.I. (2018) Heavy-tailed prior distributions for
+#     sequence count data: removing the noise and preserving large differences.
+#     Bioinformatics. https://doi.org/10.1093/bioinformatics/bty895
+par(mar=c(1,1,1,1))
+g.1 <- plotMA(res, ylim=c(-2,2), returnData=T)
+g<- plotMA(res, ylim=c(-2,2))
+png(file.path(path, "mean_normalized_counts_apglm_DeSEQ2.png"), res = 300, width=4, height = 4, units = "in")
+g
+dev.off()
+svg(file.path(path, "mean_normalized_counts_apglm_DeSEQ2.svg"), width=4, height = 4)
+g
+dev.off()
+
+df <- as.data.frame(res05) %>% filter(pvalue < 0.00054)
+write.csv(df, 
+          file=file.path(path,"uninfected_prime_vs_unprimed_deseq2_results.csv"))
+```
+
+### DeSEQ results heatmap
+```{r}
+library("pheatmap")
+ntd <- normTransform(dds)
+select <- as.data.frame(res05) %>% filter(pvalue < 0.00125) %>% rownames()
+mat <- assay(ntd[select,])
+mat.1 <- t(scale(t(mat)))
+
+
+df <- as.data.frame(colData(dds))
+df$sizeFactor <- NULL
+names(df) <- "primed"
+g <- pheatmap(mat.1, cluster_rows=T, show_rownames=F,
+         cluster_cols=T, annotation_col=df)
+g
+```
+
+#### save
+```{r}
+png(file.path(path, "sig_genes_DeSEQ2_heatmap_uninfected-primed-vs-unprimed.png"), res = 300, width=4, height = 4, units="in")
+g
+dev.off()
+svg(file.path(path, "sig_genes_DeSEQ2_heatmap_uninfected-primed-vs-unprimed.svg"), width=4, height = 4)
+g
+dev.off()
+
+
+
+```
+
+
+# Intersected genes between Unprimed vs Primed, uninfected and infected
+```{r}
+write.csv(df, 
+          file=file.path(path,"uninfected_prime_vs_unprimed_deseq2_results.csv"))
+
+uninf <- read.csv(file.path(path,"uninfected_prime_vs_unprimed_deseq2_results.csv"), )
+infected <- read.csv(file.path("outs/differential_expression/primed_vs_unprimed_infected/infected_prime_vs_unprimed_deseq2_results.csv"))
+
+same <- intersect(uninf$X, infected$X)
+same #"B2m","Clock","Cyp2a5","H2-Q6","H2-Q7","Rasgrf2","Spock2","Tgfbi" 
 ```
 
 
@@ -291,4 +530,9 @@ g
 ## "PrimedInfected" vs all
 ## "PrimedUninfected" vs all
 
+
+# Session Info
+```{r}
+sessionInfo()
+```
 
