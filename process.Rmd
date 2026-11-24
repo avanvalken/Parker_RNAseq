@@ -68,6 +68,10 @@ se <- se[apply(assay(se,"counts") != 0, 1, mean)>.2,]
 # get log-counts-cpm
 se <- mkAssay(se,  log = TRUE)
 
+# Save TMM log-CPM assay (present20-filtered genes) for reuse.
+dir.create("data_processed", showWarnings = FALSE)
+write.csv(assay(se, "log_counts_cpm"), "data_processed/log_counts_cpm.csv")
+
 #saveRDS(se, "data/processed_se.RDS")
 ```
 
@@ -234,6 +238,9 @@ dev.off()
 
 limmaResNut[order(limmaResNut$adj.P.Val),]
 write.csv(limmaResNut[1:1000,], file=file.path(path, "primed_vs_nonprimed_infected_top1k_diffex_genes.csv"))
+
+# Save full limma results (all genes, sorted by P).
+write.csv(limmaResNut, file=file.path(path, "primed_vs_nonprimed_infected_all_genes_limma.csv"))
 ```
 
 
@@ -322,6 +329,9 @@ dev.off()
 
 limmaResNut[order(limmaResNut$adj.P.Val),]
 write.csv(limmaResNut[1:1000,], file=file.path(path, "primed_vs_nonprimed_control_for_infection_siggenes_top1k_diffex_genes.csv"))
+
+# Save full limma results (all genes, sorted by P).
+write.csv(limmaResNut, file=file.path(path, "primed_vs_nonprimed_control_for_infection_all_genes_limma.csv"))
 ```
 
 ```{r}
@@ -396,6 +406,12 @@ dev.off()
 df <- as.data.frame(res05) %>% filter(pvalue < 0.00125)
 write.csv(df, 
           file=file.path(path,"infected_prime_vs_unprimed_deseq2_results.csv"))
+
+# Save full DESeq2 results (all genes) with apeglm-shrunk LFC, sorted by p-value.
+full <- as.data.frame(res05)
+full$log2FoldChange_apeglm <- res[rownames(full), "log2FoldChange"]
+write.csv(full[order(full$pvalue), ],
+          file=file.path(path,"infected_prime_vs_unprimed_deseq2_all_genes.csv"))
 ```
 
 ### DeSEQ results heatmap
@@ -479,6 +495,12 @@ dev.off()
 df <- as.data.frame(res05) %>% filter(pvalue < 0.00054)
 write.csv(df, 
           file=file.path(path,"uninfected_prime_vs_unprimed_deseq2_results.csv"))
+
+# Save full DESeq2 results (all genes) with apeglm-shrunk LFC, sorted by p-value.
+full <- as.data.frame(res05)
+full$log2FoldChange_apeglm <- res[rownames(full), "log2FoldChange"]
+write.csv(full[order(full$pvalue), ],
+          file=file.path(path,"uninfected_prime_vs_unprimed_deseq2_all_genes.csv"))
 ```
 
 ### DeSEQ results heatmap
@@ -514,15 +536,63 @@ dev.off()
 
 # Intersected genes between Unprimed vs Primed, uninfected and infected
 ```{r}
-write.csv(df, 
-          file=file.path(path,"uninfected_prime_vs_unprimed_deseq2_results.csv"))
+#write.csv(df, 
+#          file=file.path(path,"uninfected_prime_vs_unprimed_deseq2_results.csv"))
 
 uninf <- read.csv(file.path(path,"uninfected_prime_vs_unprimed_deseq2_results.csv"), )
 infected <- read.csv(file.path("outs/differential_expression/primed_vs_unprimed_infected/infected_prime_vs_unprimed_deseq2_results.csv"))
 
 same <- intersect(uninf$X, infected$X)
+uninfected_unique <- setdiff(uninf$X, infected$X)
+infected_unique <- setdiff(infected$X, uninf$X)
+
 same #"B2m","Clock","Cyp2a5","H2-Q6","H2-Q7","Rasgrf2","Spock2","Tgfbi" 
+
+outs <- file.path("outs/differential_expression/deseq2_overlap")
+dir.create(outs, showWarnings = F)
+
+write.csv(as.data.frame(infected_unique), file.path(outs, "infected_unique_gene_list.csv"))
+
+write.csv(as.data.frame(uninfected_unique), file.path(outs, "uninfected_unique_gene_list.csv"))
+
+write.csv(as.data.frame(same), file.path(outs, "overlap_gene_list.csv"))
+
+
 ```
+
+# Venn Diagram
+```{r}
+if(!require(VennDiagram)){
+     install.packages("VennDiagram")
+   }
+   library(VennDiagram)
+```
+## genelists
+```{r}
+uninf <- read.csv(file.path(path,"uninfected_prime_vs_unprimed_deseq2_results.csv"), )
+genes.uninf <- uninf$X
+infected <- read.csv(file.path("outs/differential_expression/primed_vs_unprimed_infected/infected_prime_vs_unprimed_deseq2_results.csv"))
+genes.inf <- infected$X
+
+```
+
+## plots
+```{r}
+venn.diagram(
+       x = list(genes.uninf, genes.inf),
+       category.names = c("Uninfected_primed_vs_unprimed" , "Infected_primed_vs_unprimed"),
+       fill = c("cornflowerblue", "goldenrod1"),
+       alpha = 0.50,
+       cex = 1.5,
+       cat.cex = 1.5,
+       cat.pos = 0,
+       cat.dist = 0.05,
+       filename = 'outs/differential_expression/deseq2_overlap/v_diagram.png'
+   )
+
+
+```
+
 
 
 ## "NonPrimedUninfected" vs all

@@ -1,0 +1,601 @@
+---
+title: "Parker RNA-seq — Priming effects in lung epithelium (filterByExpr, 2×2 factorial DE)"
+author: "avanvalken"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+knit: >
+  (function(input, ...) {
+    root <- dirname(dirname(normalizePath(input)))
+    out <- rmarkdown::render(
+      input,
+      output_dir    = file.path(root, "reports"),
+      knit_root_dir = root
+    )
+    source("~/.claude/skills/rmd-report-scaffold/check_tabsets.R")
+    check_tabsets(out)
+    out
+  })
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 6, dpi = 120)
+# Report theme: on-screen text ≈ body text.
+theme_report <- function(base_size = 18) {
+  ggplot2::theme_bw(base_size = base_size) +
+    ggplot2::theme(axis.text  = ggplot2::element_text(size = base_size - 1, colour = "black"),
+                   axis.title = ggplot2::element_text(size = base_size),
+                   strip.text = ggplot2::element_text(size = base_size - 1),
+                   legend.text = ggplot2::element_text(size = base_size - 2),
+                   plot.title = ggplot2::element_text(size = base_size + 1, face = "bold"))
+}
+ggplot2::theme_set(theme_report())
+```
+
+# Setup {.tabset}
+
+All data loading, model fitting and helper functions live here and are hidden by default (use the
+**Code** toggles to inspect). Sections below only summarise and plot.
+
+## libraries
+```{r libraries}
+# Packages.
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(SummarizedExperiment)
+  library(edgeR)
+  library(limma)
+  library(DESeq2)
+  library(pheatmap)
+  library(ggrepel)
+})
+
+# Output folders.
+out_dir <- "outs/differential_expression_v2"
+dirs <- file.path(out_dir, c("qc", "limma", "deseq2", "compare", "plots"))
+walk(dirs, dir.create, recursive = TRUE, showWarnings = FALSE)
+
+# Absolute project root for image embedding.
+proj_root <- dirname(dirname(normalizePath(knitr::current_input(dir = TRUE))))
+```
+
+## helper functions
+```{r helpers}
+# Markdown header emitter for dynamic tabsets.
+h <- function(title, level, tabset = FALSE)
+  cat("\n\n", strrep("#", level), " ", title, if (tabset) " {.tabset}" else "", "\n\n", sep = "")
+
+# Embed a saved PNG inside results='asis' chunks.
+embed_md <- function(path, alt = "")
+  cat(sprintf("\n\n![%s](%s)\n\n", alt, normalizePath(path, mustWork = FALSE)))
+
+# Save a ggplot as PNG + editable SVG (svglite named explicitly).
+save_plot <- function(p, path_no_ext, width = 8, height = 6, dpi = 150) {
+  if (!requireNamespace("svglite", quietly = TRUE))
+    stop("svglite is required so SVG text stays editable.", call. = FALSE)
+  ggsave(paste0(path_no_ext, ".png"), p, width = width, height = height, dpi = dpi)
+  ggsave(paste0(path_no_ext, ".svg"), p, width = width, height = height, device = svglite::svglite)
+  paste0(path_no_ext, ".png")
+}
+
+# Save a pheatmap object as PNG + SVG.
+save_pheatmap <- function(ph, path_no_ext, width = 9, height = 9) {
+  png(paste0(path_no_ext, ".png"), width = width, height = height, units = "in", res = 150)
+  grid::grid.draw(ph$gtable); dev.off()
+  svglite::svglite(paste0(path_no_ext, ".svg"), width = width, height = height)
+  grid::grid.draw(ph$gtable); dev.off()
+  paste0(path_no_ext, ".png")
+}
+
+# TMM-normalized log-CPM (prior.count = 3) for a set of kept genes.
+tmm_logcpm <- function(counts) {
+  y <- calcNormFactors(DGEList(counts), method = "TMM")
+  cpm(y, log = TRUE, prior.count = 3)
+}
+
+# Classic limma fit on TMM log-CPM, all contrasts, tidy output.
+run_limma <- function(log_cpm, design, cm) {
+  fit <- eBayes(contrasts.fit(lmFit(log_cpm, design), cm), trend = FALSE)
+  map_dfr(colnames(cm), function(nm)
+    topTable(fit, coef = nm, number = Inf, sort.by = "P") %>%
+      rownames_to_column("gene") %>%
+      transmute(contrast = nm, gene, logFC, AveExpr, stat = t,
+                pvalue = P.Value, padj = adj.P.Val))
+}
+
+# Significance-count summary for a tidy result table.
+sig_counts <- function(res) res %>%
+  group_by(across(any_of(c("tool", "contrast")))) %>%
+  summarise(padj_0.05 = sum(padj < 0.05, na.rm = TRUE),
+            padj_0.10 = sum(padj < 0.10, na.rm = TRUE),
+            p_0.05    = sum(pvalue < 0.05, na.rm = TRUE),
+            up_padj05   = sum(padj < 0.05 & logFC > 0, na.rm = TRUE),
+            down_padj05 = sum(padj < 0.05 & logFC < 0, na.rm = TRUE),
+            .groups = "drop")
+```
+
+## loading data
+```{r load-data}
+# Raw counts, sample metadata, gene annotation (same inputs as process.Rmd).
+counts_raw <- read_tsv("data/raw_gene_counts.txt", show_col_types = FALSE)
+metadata   <- read.csv("data/metadata.csv")
+genekey    <- read.csv("data/mouse_gene_id_type_name.csv")
+
+# Protein-coding genes only, counts summed per gene symbol.
+protein_coding <- genekey$gene_name[genekey$gene_type == "protein_coding"]
+counts <- counts_raw %>%
+  select(gene_name, all_of(metadata$SampleName)) %>%
+  filter(gene_name %in% protein_coding) %>%
+  group_by(gene_name) %>%
+  summarise(across(everything(), sum), .groups = "drop") %>%
+  column_to_rownames("gene_name") %>%
+  as.matrix()
+dim(counts)
+```
+
+## metadata
+```{r coldata}
+# Factors: reference levels are the unprimed / uninfected controls (modeling only).
+coldata <- metadata %>%
+  mutate(primed    = factor(ifelse(grepl("nonprimed", Group, ignore.case = TRUE), "No", "Yes"),
+                            levels = c("No", "Yes")),
+         infection = factor(ifelse(grepl("Infected", Group), "Infected", "Uninfected"),
+                            levels = c("Uninfected", "Infected")),
+         group     = factor(Group, levels = c("NonPrimedUninfected", "NonPrimedInfected",
+                                              "PrimedUninfected", "PrimedInfected"))) %>%
+  column_to_rownames("SampleName")
+stopifnot(identical(rownames(coldata), colnames(counts)))
+table(coldata$primed, coldata$infection)
+
+# Display-only colours/order: primed (interest) red & first, unprimed (reference) blue.
+group_display <- c("PrimedInfected", "PrimedUninfected", "NonPrimedInfected", "NonPrimedUninfected")
+group_cols <- c(PrimedInfected = "#C0392B", PrimedUninfected = "#F1948A",
+                NonPrimedInfected = "#2471A3", NonPrimedUninfected = "#85C1E9")
+primed_cols <- c(Yes = "#C0392B", No = "#2471A3")
+```
+
+## design and contrasts
+```{r inputs}
+# Cell-means design over all 14 samples.
+design <- model.matrix(~ 0 + group, data = coldata)
+stopifnot(qr(design)$rank == ncol(design))
+
+# Contrasts of interest; headline = priming effect within infected mice.
+cm <- makeContrasts(
+  Primed_in_Infected    = groupPrimedInfected - groupNonPrimedInfected,
+  Primed_in_Uninfected  = groupPrimedUninfected - groupNonPrimedUninfected,
+  Priming_x_Infection   = (groupPrimedInfected - groupNonPrimedInfected) -
+                          (groupPrimedUninfected - groupNonPrimedUninfected),
+  Primed_main           = ((groupPrimedInfected - groupNonPrimedInfected) +
+                           (groupPrimedUninfected - groupNonPrimedUninfected)) / 2,
+  Infection_in_Primed   = groupPrimedInfected - groupPrimedUninfected,
+  Infection_in_Unprimed = groupNonPrimedInfected - groupNonPrimedUninfected,
+  levels = design)
+cm
+headline <- "Primed_in_Infected"
+```
+
+## filtering + normalization
+```{r methods-filter}
+# filterByExpr (design-aware) vs legacy present20 (>20% non-zero, process.Rmd line 66).
+keep_fbe <- filterByExpr(DGEList(counts), design = design)
+keep_p20 <- rowMeans(counts != 0) > 0.2
+c(input = nrow(counts), filterByExpr = sum(keep_fbe), present20 = sum(keep_p20),
+  both = sum(keep_fbe & keep_p20))
+
+# TMM log-CPM on filterByExpr genes (the analysis matrix).
+counts_f <- counts[keep_fbe, ]
+log_cpm  <- tmm_logcpm(counts_f)
+```
+
+## limma fit
+```{r methods-limma}
+# Classic limma on TMM log-CPM, eBayes(trend = FALSE).
+res_limma <- run_limma(log_cpm, design, cm) %>% mutate(tool = "limma")
+
+# Same model under the legacy present20 filter, for the sensitivity check.
+res_limma_p20 <- run_limma(tmm_logcpm(counts[keep_p20, ]), design, cm) %>% mutate(tool = "limma")
+```
+
+## DESeq2 fit
+```{r methods-deseq2}
+# Wald fits on the same cell-means design and genes.
+dds <- DESeqDataSetFromMatrix(counts_f, coldata, design = ~ 0 + group)
+dds <- DESeq(dds, quiet = TRUE)
+stopifnot(identical(resultsNames(dds), colnames(design)))
+
+# Per-contrast results plus ashr-shrunken LFC (ashr accepts contrast vectors; apeglm does not).
+deseq_one <- function(nm) {
+  cv  <- cm[resultsNames(dds), nm]
+  res <- results(dds, contrast = cv, alpha = 0.05)
+  shr <- tryCatch(lfcShrink(dds, contrast = cv, res = res, type = "ashr", quiet = TRUE)$log2FoldChange,
+                  error = function(e) NA_real_)
+  as.data.frame(res) %>% rownames_to_column("gene") %>%
+    transmute(contrast = nm, gene, logFC = log2FoldChange, lfc_shrunk = shr,
+              AveExpr = log2(baseMean + 1), stat, pvalue, padj)
+}
+res_deseq <- map_dfr(colnames(cm), deseq_one) %>% mutate(tool = "DESeq2")
+
+# Omnibus LRT: does priming act differently with infection (any interaction)?
+dds_lrt <- DESeqDataSetFromMatrix(counts_f, coldata, design = ~ primed * infection)
+dds_lrt <- DESeq(dds_lrt, test = "LRT", reduced = ~ primed + infection, quiet = TRUE)
+res_lrt <- as.data.frame(results(dds_lrt, alpha = 0.05)) %>% rownames_to_column("gene")
+
+# vst for QC plots.
+vsd <- vst(dds, blind = FALSE)
+```
+
+## combine + write
+```{r wrangling}
+# Long table of both tools.
+res_all <- bind_rows(res_limma, select(res_deseq, -lfc_shrunk))
+
+# Consensus calls per contrast: padj < 0.05 in both tools, same direction.
+consensus <- res_limma %>%
+  select(contrast, gene, logFC_limma = logFC, padj_limma = padj, AveExpr) %>%
+  inner_join(res_deseq %>% select(contrast, gene, logFC_deseq = logFC,
+                                  lfc_shrunk_deseq = lfc_shrunk, padj_deseq = padj),
+             by = c("contrast", "gene")) %>%
+  mutate(sig_both = padj_limma < 0.05 & !is.na(padj_deseq) & padj_deseq < 0.05 &
+                    sign(logFC_limma) == sign(logFC_deseq))
+
+# Full per-contrast CSVs (all genes) for each tool, plus consensus.
+walk(colnames(cm), function(nm) {
+  write_csv(filter(res_limma, contrast == nm), file.path(out_dir, "limma", paste0(nm, "_limma.csv")))
+  write_csv(filter(res_deseq, contrast == nm), file.path(out_dir, "deseq2", paste0(nm, "_deseq2.csv")))
+})
+write_csv(consensus, file.path(out_dir, "compare", "consensus_limma_deseq2_all_contrasts.csv"))
+write_csv(res_lrt, file.path(out_dir, "deseq2", "Priming_x_Infection_LRT_deseq2.csv"))
+```
+
+# Background
+
+The original analysis (`process.Rmd`) used a >20%-non-zero gene filter, fit infected and uninfected
+mice as separate subsets, used an additive `~primed + infection` model for the pooled comparison, and
+cut the DESeq2 gene lists and Venn diagram on **unadjusted** p-values (p < 0.00125 / 0.00054). This
+report refits everything in one 2×2 model on all 14 samples, with `filterByExpr`, TMM normalization,
+and FDR-controlled gene lists from two tools.
+
+```{r design-table}
+# Samples per cell.
+knitr::kable(dplyr::count(coldata, primed, infection, name = "n"), caption = "Samples per group")
+```
+
+# Methods
+
+- **Filtering.** `edgeR::filterByExpr` keeps genes with enough counts in at least the smallest group
+  (n = 3), adapting to library size.
+- **limma.** Classic limma on TMM-normalized log2-CPM (prior count 3), empirical-Bayes moderated t.
+- **DESeq2.** Negative-binomial Wald tests on the same design; LFCs also shrunk with ashr.
+  An LRT (`~primed*infection` vs `~primed+infection`) tests whether any interaction exists.
+- **Model.** One cell-means model (`~0 + group`) on all samples; every comparison is a contrast, so
+  all comparisons share one variance estimate from 14 samples rather than 7–8.
+- **Headline gene list.** padj < 0.05 (BH) in both limma and DESeq2, same direction.
+
+# Sample QC {.tabset}
+
+- **Question.** Do samples group by priming/infection, and are any outliers?
+- **Why.** An outlier or hidden batch can drive or mask DE results.
+- **Method.** PCA on TMM log-CPM and on vst, sample-distance heatmap, library sizes, Cook's distances.
+- **Why this method.** These are the standard pre-DE checks; each catches a different failure.
+
+## PCA (log-CPM)
+```{r pca-logcpm, fig.width = 9, fig.height = 7}
+# PCA on TMM log-CPM of filtered genes.
+pc <- prcomp(t(log_cpm))
+ve <- round(100 * pc$sdev^2 / sum(pc$sdev^2), 1)
+pca_df <- as.data.frame(pc$x[, 1:2]) %>% rownames_to_column("sample") %>%
+  left_join(rownames_to_column(coldata, "sample"), by = "sample") %>%
+  mutate(group = factor(as.character(group), levels = group_display))
+p <- ggplot(pca_df, aes(PC1, PC2, colour = group, shape = infection)) +
+  geom_point(size = 5) + geom_text_repel(aes(label = sample), size = 5, show.legend = FALSE) +
+  scale_colour_manual(values = group_cols) +
+  labs(x = paste0("PC1 (", ve[1], "%)"), y = paste0("PC2 (", ve[2], "%)"), title = "PCA, TMM log-CPM")
+save_plot(p, file.path(out_dir, "qc", "pca_logcpm"), 9, 7)
+p
+```
+
+## PCA (vst)
+```{r pca-vst, fig.width = 9, fig.height = 7}
+# PCA on DESeq2 vst.
+pv <- plotPCA(vsd, intgroup = c("group", "infection"), returnData = TRUE)
+pv$group <- factor(as.character(pv$group), levels = group_display)
+pvv <- round(100 * attr(pv, "percentVar"), 1)
+p <- ggplot(pv, aes(PC1, PC2, colour = group, shape = infection)) +
+  geom_point(size = 5) + geom_text_repel(aes(label = name), size = 5, show.legend = FALSE) +
+  scale_colour_manual(values = group_cols) +
+  labs(x = paste0("PC1 (", pvv[1], "%)"), y = paste0("PC2 (", pvv[2], "%)"), title = "PCA, vst (top 500)")
+save_plot(p, file.path(out_dir, "qc", "pca_vst"), 9, 7)
+p
+```
+
+## Sample distances
+```{r sample-dist, fig.width = 10, fig.height = 9}
+# Euclidean distances on vst.
+ann <- coldata[, c("primed", "infection")]
+ph <- pheatmap(as.matrix(dist(t(assay(vsd)))), annotation_col = ann, annotation_row = ann,
+               annotation_colors = list(primed = primed_cols,
+                                        infection = c(Infected = "black", Uninfected = "grey80")),
+               fontsize = 16, border_color = NA, silent = TRUE,
+               color = colorRampPalette(c("navy", "white"))(100), main = "Sample distances (vst)")
+save_pheatmap(ph, file.path(out_dir, "qc", "sample_distance_heatmap"), 10, 9)
+grid::grid.draw(ph$gtable)
+```
+
+## Library size
+```{r libsize, fig.width = 10, fig.height = 6}
+# Library sizes; flag > 3x or < 1/3 of median.
+lib <- tibble(sample = colnames(counts), lib = colSums(counts)) %>%
+  left_join(rownames_to_column(coldata, "sample"), by = "sample") %>%
+  mutate(group = factor(as.character(group), levels = group_display),
+         sample = fct_reorder(sample, as.integer(group)))
+p <- ggplot(lib, aes(sample, lib / 1e6, fill = group)) + geom_col() +
+  geom_hline(yintercept = median(lib$lib) / 1e6 * c(1/3, 3), linetype = 2) +
+  scale_fill_manual(values = group_cols) +
+  labs(x = NULL, y = "Protein-coding reads (M)", title = "Library sizes") +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1))
+save_plot(p, file.path(out_dir, "qc", "library_sizes"), 10, 6)
+p
+```
+
+## Cook's distance
+```{r cooks, fig.width = 10, fig.height = 6}
+# Per-sample Cook's distance distribution from the DESeq2 fit.
+ck <- as.data.frame(log10(assays(dds)[["cooks"]] + 1e-8)) %>%
+  pivot_longer(everything(), names_to = "sample", values_to = "log10_cooks") %>%
+  left_join(rownames_to_column(coldata, "sample"), by = "sample") %>%
+  mutate(group = factor(as.character(group), levels = group_display))
+p <- ggplot(ck, aes(sample, log10_cooks, fill = group)) + geom_boxplot(outlier.size = 0.5) +
+  scale_fill_manual(values = group_cols) +
+  labs(x = NULL, y = "log10 Cook's distance", title = "Cook's distance by sample") +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1))
+save_plot(p, file.path(out_dir, "qc", "cooks_distance"), 10, 6)
+p
+```
+
+# Filter sensitivity: present20 vs filterByExpr {.tabset}
+
+- **Question.** How much does replacing the old >20%-non-zero filter with `filterByExpr` change results?
+- **Why.** If the filter, not the biology, drives the gene list, neither list can be trusted.
+- **Method.** Same limma model under each filter; compare significant sets and effect sizes on shared genes.
+- **Why this method.** Holding everything else fixed isolates the filter's effect.
+
+## Summary
+```{r filter-sens}
+# Per-contrast overlap and agreement between filters.
+filt_cmp <- map_dfr(colnames(cm), function(nm) {
+  a <- filter(res_limma_p20, contrast == nm); b <- filter(res_limma, contrast == nm)
+  sa <- a$gene[a$padj < 0.05]; sb <- b$gene[b$padj < 0.05]
+  sh <- inner_join(a, b, by = "gene", suffix = c("_p20", "_fbe"))
+  tibble(contrast = nm, kept_p20 = sum(keep_p20), kept_fbe = sum(keep_fbe),
+         sig_p20 = length(sa), sig_fbe = length(sb), sig_shared = length(intersect(sa, sb)),
+         sig_only_p20 = length(setdiff(sa, sb)), sig_only_fbe = length(setdiff(sb, sa)),
+         logFC_r = round(cor(sh$logFC_p20, sh$logFC_fbe), 3),
+         t_r = round(cor(sh$stat_p20, sh$stat_fbe), 3))
+})
+write_csv(filt_cmp, file.path(out_dir, "compare", "filter_sensitivity_present20_vs_filterByExpr.csv"))
+knitr::kable(filt_cmp, caption = "limma, padj < 0.05, under each filter")
+```
+
+# DE results {.tabset}
+
+- **Question.** Which genes change with priming, in infected mice, uninfected mice, and differently between them?
+- **Why.** The study's focus is priming-dependent genes, especially under infection.
+- **Method.** Six contrasts from one model, tested with limma and DESeq2; LRT for any interaction.
+- **Why this method.** One model uses all samples for variance; two tools guard against tool-specific artefacts.
+
+## Counts
+```{r counts-table}
+# Significant-gene counts per tool and contrast.
+cnt <- sig_counts(res_all) %>%
+  left_join(consensus %>% group_by(contrast) %>% summarise(consensus_padj05 = sum(sig_both)),
+            by = "contrast") %>%
+  arrange(factor(contrast, levels = colnames(cm)), tool)
+write_csv(cnt, file.path(out_dir, "compare", "sig_gene_counts.csv"))
+knitr::kable(cnt, caption = "Genes passing each threshold (consensus = padj < 0.05 in both tools, same sign)")
+
+# Omnibus interaction LRT.
+knitr::kable(tibble(test = "LRT ~primed*infection vs ~primed+infection",
+                    padj_0.05 = sum(res_lrt$padj < 0.05, na.rm = TRUE),
+                    padj_0.10 = sum(res_lrt$padj < 0.10, na.rm = TRUE),
+                    p_0.05 = sum(res_lrt$pvalue < 0.05, na.rm = TRUE)),
+             caption = "DESeq2 interaction LRT")
+```
+
+## Tool concordance
+```{r concordance}
+# Direction agreement among each contrast's top-200 limma genes.
+conc <- consensus %>% group_by(contrast) %>%
+  summarise(logFC_r = cor(logFC_limma, logFC_deseq, use = "complete.obs"),
+            top200_same_direction = mean(sign(logFC_limma[order(padj_limma)][1:200]) ==
+                                         sign(logFC_deseq[order(padj_limma)][1:200])))
+knitr::kable(conc, digits = 3, caption = "limma vs DESeq2 agreement")
+```
+
+```{r per-contrast, results = "asis"}
+# One tab per contrast; one figure per sub-tab.
+walk(colnames(cm), function(nm) {
+  h(nm, 2, tabset = TRUE)
+  rl <- filter(res_limma, contrast == nm); rd <- filter(res_deseq, contrast == nm)
+
+  # Volcano per tool: up (higher in first group of contrast) red, down blue.
+  walk(list(limma = rl, DESeq2 = rd), function(r) {
+    tool <- r$tool[1]
+    r <- r %>% filter(!is.na(padj)) %>%
+      mutate(dir = case_when(padj < 0.05 & logFC > 0 ~ "Up", padj < 0.05 & logFC < 0 ~ "Down", TRUE ~ "NS"))
+    lab <- r %>% filter(dir != "NS") %>% slice_min(pvalue, n = 15)
+    p <- ggplot(r, aes(logFC, -log10(pvalue), colour = dir)) + geom_point(size = 1.2, alpha = 0.7) +
+      geom_text_repel(data = lab, aes(label = gene), size = 5, show.legend = FALSE, max.overlaps = 30) +
+      scale_colour_manual(values = c(Up = "#C0392B", Down = "#2471A3", NS = "grey70")) +
+      labs(title = paste(nm, "—", tool), colour = "padj < 0.05")
+    h(paste("Volcano", tool), 3)
+    embed_md(save_plot(p, file.path(out_dir, "plots", paste0(nm, "_volcano_", tool)), 9, 7), "")
+  })
+
+  # p-value histograms, both tools.
+  p <- bind_rows(rl, rd) %>% filter(!is.na(pvalue)) %>%
+    ggplot(aes(pvalue)) + geom_histogram(bins = 50, boundary = 0, fill = "grey40") +
+    facet_wrap(~tool) + labs(title = paste(nm, "— p-value histogram"))
+  h("p-value histogram", 3)
+  embed_md(save_plot(p, file.path(out_dir, "plots", paste0(nm, "_phist")), 10, 5), "")
+
+  # MA plot from DESeq2, shrunken LFC where available.
+  ma <- rd %>% mutate(y = coalesce(lfc_shrunk, logFC), sig = !is.na(padj) & padj < 0.05)
+  p <- ggplot(ma, aes(AveExpr, y, colour = sig)) + geom_point(size = 1, alpha = 0.6) +
+    scale_colour_manual(values = c(`TRUE` = "#C0392B", `FALSE` = "grey70")) +
+    geom_hline(yintercept = 0) +
+    labs(x = "log2(mean normalized count + 1)", y = "log2FC (ashr-shrunk)",
+         title = paste(nm, "— MA (DESeq2)"), colour = "padj < 0.05")
+  h("MA plot", 3)
+  embed_md(save_plot(p, file.path(out_dir, "plots", paste0(nm, "_MA_deseq2")), 9, 6), "")
+
+  # Top consensus genes table.
+  h("Top genes", 3)
+  tt <- consensus %>% filter(contrast == nm) %>% arrange(padj_limma) %>%
+    select(gene, logFC_limma, padj_limma, logFC_deseq, padj_deseq, sig_both) %>% head(30)
+  print(knitr::kable(tt, digits = 4, caption = "Top 30 by limma padj"))
+})
+```
+
+# Priming genes in infected mice {.tabset}
+
+- **Question.** Which priming-affected genes are specific to infected mice?
+- **Why.** This is the study's main question.
+- **Method.** Classify consensus genes by whether priming is significant in infected, uninfected, or both, and flag the formal interaction test.
+- **Why this method.** "Significant in one, not the other" is not proof of a difference; the interaction contrast is that proof, so both are shown.
+
+## Classification
+```{r classify, fig.width = 9, fig.height = 6}
+# Wide consensus calls for the two priming contrasts plus interaction.
+calls <- consensus %>%
+  filter(contrast %in% c("Primed_in_Infected", "Primed_in_Uninfected", "Priming_x_Infection")) %>%
+  select(contrast, gene, sig_both, logFC_limma, padj_limma) %>%
+  pivot_wider(names_from = contrast, values_from = c(sig_both, logFC_limma, padj_limma)) %>%
+  left_join(select(res_lrt, gene, padj_LRT = padj), by = "gene") %>%
+  mutate(class = case_when(
+    sig_both_Primed_in_Infected & sig_both_Primed_in_Uninfected ~ "Both",
+    sig_both_Primed_in_Infected  ~ "Infected only",
+    sig_both_Primed_in_Uninfected ~ "Uninfected only",
+    TRUE ~ "Neither"),
+    interaction_sig = coalesce(sig_both_Priming_x_Infection, FALSE) |
+                      coalesce(padj_LRT < 0.05, FALSE))
+write_csv(filter(calls, class != "Neither" | interaction_sig),
+          file.path(out_dir, "compare", "priming_gene_classification.csv"))
+
+# Bar of class sizes, split by interaction support.
+p <- calls %>% filter(class != "Neither") %>%
+  dplyr::count(class, interaction_sig) %>%
+  mutate(class = factor(class, levels = c("Infected only", "Both", "Uninfected only"))) %>%
+  ggplot(aes(class, n, fill = interaction_sig)) + geom_col() +
+  geom_text(aes(label = n), position = position_stack(vjust = 0.5), size = 6) +
+  scale_fill_manual(values = c(`TRUE` = "#C0392B", `FALSE` = "grey60")) +
+  labs(x = NULL, y = "Genes (consensus padj < 0.05)", fill = "Interaction sig",
+       title = "Where is priming significant?")
+save_plot(p, file.path(out_dir, "compare", "priming_classification_bar"), 9, 6)
+p
+```
+
+## Infected-only genes
+```{r infected-only-table}
+# Genes primed-responsive only in infected mice.
+knitr::kable(calls %>% filter(class == "Infected only") %>%
+               arrange(padj_limma_Primed_in_Infected) %>%
+               select(gene, logFC_limma_Primed_in_Infected, padj_limma_Primed_in_Infected,
+                      logFC_limma_Primed_in_Uninfected, padj_limma_Priming_x_Infection,
+                      padj_LRT, interaction_sig) %>% head(50),
+             digits = 4, caption = "Top 50 'Infected only' genes (full list in CSV)")
+```
+
+## Heatmap (headline)
+```{r heatmap-headline, fig.width = 10, fig.height = 10}
+# Row z-scored log-CPM of headline consensus genes (top 60 by limma padj), all samples.
+hl <- consensus %>% filter(contrast == headline, sig_both) %>% arrange(padj_limma)
+hl_genes <- head(hl$gene, 60)
+if (length(hl_genes) >= 2) {
+  ord <- rownames(coldata)[order(match(as.character(coldata$group), group_display))]
+  ph <- pheatmap(log_cpm[hl_genes, ord], scale = "row", cluster_cols = FALSE, cluster_rows = TRUE,
+                 annotation_col = coldata[, "group", drop = FALSE],
+                 annotation_colors = list(group = group_cols),
+                 show_rownames = length(hl_genes) <= 40, fontsize = 16, border_color = NA, silent = TRUE,
+                 color = colorRampPalette(c("blue", "white", "red"))(100),
+                 main = paste(headline, "— consensus genes"))
+  save_pheatmap(ph, file.path(out_dir, "plots", paste0(headline, "_heatmap")), 10, 10)
+  grid::grid.draw(ph$gtable)
+} else cat("Fewer than 2 consensus genes; no heatmap.")
+```
+
+# Old vs new {.tabset}
+
+- **Question.** How do the new FDR-controlled lists compare with the original `process.Rmd` lists?
+- **Why.** Downstream IPA/Venn work used the original lists.
+- **Method.** Overlap of the old DESeq2 (raw p < 0.00125 / 0.00054) and old limma (padj < 0.05) lists with the new results.
+- **Why this method.** Shows which old hits survive the corrected model.
+
+## Overlap
+```{r old-vs-new}
+# Old gene lists from process.Rmd outputs.
+old_dir <- "outs/differential_expression"
+old <- list(
+  old_deseq2_infected   = read.csv(file.path(old_dir, "primed_vs_unprimed_infected/infected_prime_vs_unprimed_deseq2_results.csv"))$X,
+  old_deseq2_uninfected = read.csv(file.path(old_dir, "primed_vs_unprimed_uninfected/uninfected_prime_vs_unprimed_deseq2_results.csv"))$X,
+  old_limma_infected    = read.csv(file.path(old_dir, "limma/primed_vs_unprimed_infected/primed_vs_nonprimed_infected_top1k_diffex_genes.csv")) %>%
+                            filter(adj.P.Val < 0.05) %>% pull(X))
+new_map <- c(old_deseq2_infected = "Primed_in_Infected", old_deseq2_uninfected = "Primed_in_Uninfected",
+             old_limma_infected = "Primed_in_Infected")
+
+# Overlap of each old list with the matching new consensus list.
+ov <- imap_dfr(old, function(g, nm) {
+  nw <- consensus %>% filter(contrast == new_map[[nm]], sig_both) %>% pull(gene)
+  tibble(old_list = nm, new_contrast = new_map[[nm]], n_old = length(g), n_new_consensus = length(nw),
+         overlap = length(intersect(g, nw)),
+         old_with_new_limma_padj05 = sum(g %in% filter(res_limma, contrast == new_map[[nm]], padj < 0.05)$gene))
+})
+write_csv(ov, file.path(out_dir, "compare", "old_vs_new_overlap.csv"))
+knitr::kable(ov, caption = "Old lists vs new results")
+```
+
+# IPA export
+
+```{r ipa, results = "asis"}
+# IPA-ready 4-column uploads (Entrez first) when org.Mm.eg.db is installed.
+if (requireNamespace("org.Mm.eg.db", quietly = TRUE)) {
+  ipa_dir <- file.path(out_dir, "ipa_upload"); dir.create(ipa_dir, showWarnings = FALSE)
+  walk(c("Primed_in_Infected", "Primed_in_Uninfected", "Priming_x_Infection"), function(nm) {
+    tt <- res_limma %>% filter(contrast == nm) %>% arrange(pvalue) %>%
+      mutate(entrez = AnnotationDbi::mapIds(org.Mm.eg.db::org.Mm.eg.db, gene, "ENTREZID", "SYMBOL",
+                                            multiVals = "first"))
+    fmt <- function(d) d %>% filter(!is.na(entrez), !duplicated(entrez)) %>%
+      transmute(entrez, logFC, P.Value = pvalue, adj.P.Val = padj)
+    data.table::fwrite(fmt(filter(tt, padj < 0.05)), file.path(ipa_dir, paste0(nm, ".txt")), sep = "\t")
+    if (sum(tt$padj < 0.05) < 400)
+      data.table::fwrite(fmt(filter(tt, padj < 0.10)), file.path(ipa_dir, paste0(nm, "_padj10.txt")), sep = "\t")
+    if (sum(tt$padj < 0.10) < 15)
+      data.table::fwrite(fmt(filter(tt, pvalue < 0.05)), file.path(ipa_dir, paste0(nm, "_pval05.txt")), sep = "\t")
+  })
+  cat("IPA uploads (limma) written to `", ipa_dir, "`. `_pval05` files are NOT FDR-controlled.\n", sep = "")
+} else cat("`org.Mm.eg.db` not installed — IPA export skipped. Install with `BiocManager::install('org.Mm.eg.db')`.\n")
+```
+
+# Plain-language summary
+
+- **What was compared.** Four groups of lung epithelial cells: primed or not, infected or not
+  (3–4 mice each). The main question is which genes priming changes in infected mice.
+- **One model for everything.** All 14 samples go into one model, so the estimate of how
+  much each gene varies naturally comes from more mice than any single two-group comparison.
+- **"Specific to infection" needs its own test.** A gene significant in infected mice but not
+  uninfected mice is not proof priming acts differently under infection; the gene might just miss the
+  cutoff. The *Priming_x_Infection* contrast (and the LRT) test that difference directly. With 3–4
+  mice per group that test has little power, so expect few hits.
+- **Gene lists are FDR-controlled.** A gene is called changed only if, after correcting for testing
+  ~10,000+ genes (BH), it passes 5% FDR in both limma and DESeq2 in the same direction.
+- **Where to look.** Per-contrast tables: `outs/differential_expression_v2/{limma,deseq2}/`;
+  consensus and classification: `outs/differential_expression_v2/compare/`.
+
+# Session info
+```{r session-info}
+sessionInfo()
+```
